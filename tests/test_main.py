@@ -62,3 +62,9 @@ def test_volumes_help():
     """Test volumes --help."""
     sys.argv = ["geoclaw-landspill", "volumes", "--help"]
     call_main()
+
+
+def test_preprocess_dem_help():
+    """Test preprocess-dem --help."""
+    sys.argv = ["geoclaw-landspill", "preprocess-dem", "--help"]
+    call_main()

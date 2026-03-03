@@ -15,6 +15,7 @@ import subprocess
 import psutil
 import gclandspill
 from gclandspill._preprocessing import create_data
+from gclandspill._preprocessing import preprocess_dem_file
 from gclandspill._postprocessing.netcdf import convert_to_netcdf
 from gclandspill._postprocessing.plotdepth import plot_depth
 from gclandspill._postprocessing.plottopo import plot_topo
@@ -279,6 +280,43 @@ def main():
         """)
     parser_volumes.set_defaults(func=create_volume_csv)  # callback for the `volumes` command
 
+    # `preprocess-dem` command
+    # ----------------------------------------------------------------------------------------------
+    parser_preprocess_dem = subparsers.add_parser(
+        name="preprocess-dem",
+        help="Process a DEM from a file path and optionally crop it with a buffer zone.",
+        description="Process a DEM from a file path and optionally crop it with a buffer zone."
+    )
+    parser_preprocess_dem.add_argument(
+        "--dem", dest="dem", action="store", type=pathlib.Path, required=True,
+        help="Path to the source DEM raster (e.g., GeoTIFF)."
+    )
+    parser_preprocess_dem.add_argument(
+        "--output", dest="output", action="store", type=pathlib.Path, required=True,
+        help="Output path for the processed DEM raster."
+    )
+    parser_preprocess_dem.add_argument(
+        "--summary", dest="summary", action="store", type=pathlib.Path,
+        help="Optional output path for a JSON summary (default: <output>.summary.json)."
+    )
+    parser_preprocess_dem.add_argument(
+        "--decimate", dest="decimate", action="store", type=int, default=1,
+        help="Integer decimation factor for downsampling (default: 1)."
+    )
+    parser_preprocess_dem.add_argument(
+        "--source-row", dest="source_row", action="store", type=int,
+        help="Source row used as ROI center (default: DEM midpoint)."
+    )
+    parser_preprocess_dem.add_argument(
+        "--source-col", dest="source_col", action="store", type=int,
+        help="Source column used as ROI center (default: DEM midpoint)."
+    )
+    parser_preprocess_dem.add_argument(
+        "--roi-buffer-m", dest="roi_buffer_m", action="store", type=float, default=0.0,
+        help="Buffer radius in meters around source used to crop DEM (default: 0, no crop)."
+    )
+    parser_preprocess_dem.set_defaults(func=preprocess_dem)
+
     # parse the cmd
     # ----------------------------------------------------------------------------------------------
     args = parser.parse_args()
@@ -326,6 +364,28 @@ def run(args: argparse.Namespace):
     result = subprocess.run([solver], capture_output=False, cwd=str(args.output), check=True)
 
     return result.returncode
+
+
+def preprocess_dem(args: argparse.Namespace):
+    """Preprocess DEM with optional decimation and ROI buffer crop."""
+
+    summary = preprocess_dem_file(
+        dem_path=args.dem,
+        output_path=args.output,
+        decimate=args.decimate,
+        source_row=args.source_row,
+        source_col=args.source_col,
+        roi_buffer_m=args.roi_buffer_m,
+        summary_path=args.summary
+    )
+
+    print("DEM preprocessing completed:")
+    print("  source DEM: {}".format(summary["dem_path"]))
+    print("  output DEM: {}".format(summary["output_path"]))
+    print("  ROI buffer (m): {}".format(summary["roi_stats"]["buffer_m"]))
+    print("  invalid cells before filling: {}".format(summary["dem_stats"]["invalid_total"]))
+    print("  invalid cells remaining: {}".format(summary["dem_stats"]["invalid_remaining"]))
+    return 0
 
 
 if __name__ == "__main__":

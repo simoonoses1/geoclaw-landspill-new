@@ -14,6 +14,7 @@ import time
 import pathlib
 import shutil
 import glob
+import json
 from typing import Tuple
 
 import urllib3
@@ -22,6 +23,7 @@ import numpy
 import rasterio
 import rasterio.features
 import rasterio.transform
+from rasterio.enums import Resampling
 from gclandspill import _misc
 from gclandspill import clawutil
 
@@ -94,6 +96,174 @@ def create_data(
 
     # check if hudro file exists. Download it if not exist
     check_download_hydro(case_dir, rundata)
+
+
+def prepare_dem(dem_path: os.PathLike, decimate: int = 1):
+    """Read a DEM from raster, optionally decimate it, and return DEM/profile/cell sizes."""
+
+    dem_path = pathlib.Path(dem_path).expanduser().resolve()
+
+    with rasterio.open(dem_path) as src:
+        if decimate <= 1:
+            dem = src.read(1)
+            profile = src.profile.copy()
+            transform = src.transform
+        else:
+            out_rows = max(1, src.height // decimate)
+            out_cols = max(1, src.width // decimate)
+            dem = src.read(1, out_shape=(out_rows, out_cols), resampling=Resampling.average)
+            transform = src.transform * src.transform.scale(src.width / out_cols, src.height / out_rows)
+            profile = src.profile.copy()
+            profile.update(height=out_rows, width=out_cols, transform=transform)
+
+    dx = abs(transform.a)
+    dy = abs(transform.e)
+    return dem.astype(float), profile, dx, dy
+
+
+def fill_nodata_local_average(dem, invalid, max_iters=8):
+    """Fill nodata using local 8-neighbor average."""
+
+    work = dem.copy()
+    rem = invalid.copy()
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+    for _ in range(max_iters):
+        if not rem.any():
+            break
+
+        sums = numpy.zeros_like(work)
+        cnt = numpy.zeros_like(work, dtype=int)
+
+        for dr, dc in neighbors:
+            src = work[max(0, dr): work.shape[0] + min(0, dr), max(0, dc): work.shape[1] + min(0, dc)]
+            src_mask = rem[max(0, dr): work.shape[0] + min(0, dr), max(0, dc): work.shape[1] + min(0, dc)]
+            dst_r0, dst_r1 = max(0, -dr), work.shape[0] - max(0, dr)
+            dst_c0, dst_c1 = max(0, -dc), work.shape[1] - max(0, dc)
+            valid = ~src_mask
+            sums[dst_r0:dst_r1, dst_c0:dst_c1] += src * valid
+            cnt[dst_r0:dst_r1, dst_c0:dst_c1] += valid.astype(int)
+
+        fillable = rem & (cnt > 0)
+
+        if not fillable.any():
+            break
+
+        work[fillable] = sums[fillable] / cnt[fillable]
+        rem[fillable] = False
+
+    return work, rem
+
+
+def validate_dem(dem, nodata=None):
+    """Validate and patch invalid cells in DEM."""
+
+    invalid = numpy.isnan(dem)
+
+    if nodata is not None:
+        invalid = invalid | (dem == nodata)
+
+    total = int(invalid.sum())
+    clean, rem = fill_nodata_local_average(dem, invalid)
+    stats = {
+        "invalid_total": total,
+        "invalid_remaining": int(rem.sum()),
+        "z_min": float(numpy.nanmin(clean)),
+        "z_max": float(numpy.nanmax(clean))
+    }
+    return clean, stats
+
+
+def crop_dem_with_buffer(dem, profile, source_row, source_col, dx, dy, buffer_m):
+    """Crop DEM around a source point using a metric buffer distance."""
+
+    if buffer_m <= 0:
+        return dem, profile.copy(), {
+            "roi_row_start": 0,
+            "roi_row_end": int(dem.shape[0]),
+            "roi_col_start": 0,
+            "roi_col_end": int(dem.shape[1]),
+            "roi_cells": int(dem.size),
+            "buffer_m": float(buffer_m)
+        }
+
+    r_radius = int(numpy.ceil(buffer_m / max(dy, 1e-12)))
+    c_radius = int(numpy.ceil(buffer_m / max(dx, 1e-12)))
+
+    r0 = max(0, source_row - r_radius)
+    r1 = min(dem.shape[0], source_row + r_radius + 1)
+    c0 = max(0, source_col - c_radius)
+    c1 = min(dem.shape[1], source_col + c_radius + 1)
+
+    cropped = dem[r0:r1, c0:c1]
+    transform = profile["transform"]
+    cropped_transform = rasterio.transform.Affine(
+        transform.a, transform.b, transform.c + c0 * transform.a + r0 * transform.b,
+        transform.d, transform.e, transform.f + c0 * transform.d + r0 * transform.e
+    )
+
+    updated = profile.copy()
+    updated.update(height=cropped.shape[0], width=cropped.shape[1], transform=cropped_transform)
+    stats = {
+        "roi_row_start": int(r0),
+        "roi_row_end": int(r1),
+        "roi_col_start": int(c0),
+        "roi_col_end": int(c1),
+        "roi_cells": int(cropped.size),
+        "buffer_m": float(buffer_m)
+    }
+    return cropped, updated, stats
+
+
+def preprocess_dem_file(
+        dem_path: os.PathLike,
+        output_path: os.PathLike,
+        decimate: int = 1,
+        source_row: int = None,
+        source_col: int = None,
+        roi_buffer_m: float = 0.0,
+        summary_path: os.PathLike = None):
+    """Preprocess a DEM from a local path and write processed raster and summary."""
+
+    dem, profile, dx, dy = prepare_dem(dem_path, decimate)
+    dem, dem_stats = validate_dem(dem, profile.get("nodata"))
+
+    ny, nx = dem.shape
+    source_row = ny // 2 if source_row is None else source_row
+    source_col = nx // 2 if source_col is None else source_col
+
+    if not (0 <= source_row < ny and 0 <= source_col < nx):
+        raise ValueError("Source index out of DEM bounds")
+
+    dem, profile, roi_stats = crop_dem_with_buffer(
+        dem, profile, source_row, source_col, dx, dy, roi_buffer_m)
+
+    output_path = pathlib.Path(output_path).expanduser().resolve()
+    os.makedirs(output_path.parent, exist_ok=True)
+    profile.update(dtype=rasterio.float64, count=1)
+
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(dem.astype(numpy.float64), 1)
+
+    summary = {
+        "dem_path": str(pathlib.Path(dem_path).expanduser().resolve()),
+        "output_path": str(output_path),
+        "decimate": int(decimate),
+        "cell_size": {"dx": float(dx), "dy": float(dy)},
+        "source": {"row": int(source_row), "col": int(source_col)},
+        "dem_stats": dem_stats,
+        "roi_stats": roi_stats
+    }
+
+    if summary_path is None:
+        summary_path = output_path.with_suffix(".summary.json")
+
+    summary_path = pathlib.Path(summary_path).expanduser().resolve()
+
+    with open(summary_path, "w", encoding="utf-8") as file_obj:
+        json.dump(summary, file_obj, indent=2)
+
+    return summary
 
 
 def check_download_topo(case_dir: os.PathLike, rundata: clawutil.data.ClawRunData):
